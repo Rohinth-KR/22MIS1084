@@ -8,6 +8,8 @@
 4. [Stage 2: Database Design](#4-stage-2-database-design)
 5. [Stage 2: Scalability Planning](#5-stage-2-scalability-planning)
 6. [Stage 3: Query Optimization & Indexing](#6-stage-3-query-optimization--indexing)
+7. [Stage 4: High-Scale Retrieval Optimization](#7-stage-4-high-scale-retrieval-optimization)
+8. [Stage 5: Reliable Massive Delivery Architecture](#8-stage-5-reliable-massive-delivery-architecture)
 
 ---
 
@@ -943,5 +945,311 @@ ON delivery_records (delivered_at DESC);
 
 ---
 
-*Document version: 2.0 | Roll: 22MIS1084*
+## 7. Stage 4: High-Scale Retrieval Optimization
 
+### Problem Statement
+
+If every student fetches notifications on every page load via a direct DB query, the database faces **N × PageLoads queries/second**. With 10K students loading pages 10 times/day, that's **100K identical queries/day**. This section proposes solutions.
+
+### 7.1 Redis Caching
+
+Cache feeds and unread counts in Redis. Serve from cache on hit; fall back to DB on miss.
+
+```python
+async def get_feed(student_id, page=1):
+    cache_key = f"feed:{student_id}:p{page}"
+    cached = await redis.get(cache_key)
+    if cached:
+        return json.loads(cached)       # Cache HIT
+    result = await db.fetch_feed(student_id, page)
+    await redis.setex(cache_key, 60, json.dumps(result))  # TTL 60s
+    return result
+```
+
+| Aspect | Detail |
+|--------|--------|
+| **Advantage** | 95%+ hit rate; sub-ms reads; massive DB load reduction |
+| **Disadvantage** | Staleness up to TTL; memory cost; invalidation complexity |
+| **Tradeoff** | 60s staleness is acceptable for most campus notifications |
+| **Performance** | DB queries reduced ~95%; p99 latency 50ms → 1ms |
+
+### 7.2 Pagination
+
+Never return full history. Fetch 20 items per page.
+
+```sql
+-- Cursor-based (efficient for feeds)
+SELECT * FROM notifications WHERE created_at < $cursor
+ORDER BY created_at DESC LIMIT 20;
+```
+
+| Aspect | Detail |
+|--------|--------|
+| **Advantage** | Constant query time with indexes; predictable response size |
+| **Disadvantage** | Cursor requires client state; no random page jumps |
+| **Tradeoff** | Cursor is 100x faster at deep pages but harder to implement |
+| **Performance** | Scans 20 rows instead of 10K+; response 500KB → 5KB |
+
+### 7.3 Infinite Scrolling
+
+Load next page automatically when user scrolls to bottom. Combines with cursor pagination.
+
+```javascript
+observer.observe(sentinelElement);
+async function loadMore() {
+    const data = await fetch(`/api/v1/notifications?cursor=${lastCursor}&limit=20`);
+    appendToDOM(data);
+    lastCursor = data.pagination.nextCursor;
+}
+```
+
+| Aspect | Detail |
+|--------|--------|
+| **Advantage** | Smooth UX; loads data only when needed |
+| **Disadvantage** | Hard to bookmark; back-navigation issues |
+| **Tradeoff** | Better UX than buttons but requires scroll state management |
+| **Performance** | Initial load: 20 items (5KB) vs all (500KB) — 100x reduction |
+
+### 7.4 Lazy Loading
+
+Load previews first (title + category), fetch full body on click.
+
+```
+Initial:  GET /notifications?fields=id,title,category,createdAt  (lightweight)
+On click: GET /notifications/{id}  (full body)
+```
+
+| Aspect | Detail |
+|--------|--------|
+| **Advantage** | Faster initial render; reduced bandwidth |
+| **Disadvantage** | Extra roundtrip on expand |
+| **Tradeoff** | One extra call per opened notification; saves bandwidth for 90% unread |
+| **Performance** | Initial payload 80% smaller |
+
+### 7.5 WebSockets Instead of Polling
+
+Replace `setInterval` polling with persistent WebSocket. Server pushes only on new events.
+
+```
+POLLING:    12 req/min/user → 120K req/min for 10K users
+WEBSOCKET:  ~50 messages/day/user (push on event only)
+```
+
+| Aspect | Detail |
+|--------|--------|
+| **Advantage** | Real-time; eliminates 99.9% of polling requests |
+| **Disadvantage** | ~50KB memory per connection; sticky sessions needed |
+| **Tradeoff** | 3K concurrent WS = 150MB RAM vs 120K HTTP req/min |
+| **Performance** | DB queries for updates drop from 120K/min to near-zero |
+
+### 7.6 Read Replicas
+
+Route all reads to PostgreSQL replicas. Only writes go to primary.
+
+```python
+def get_db(operation):
+    if operation == "read":
+        return replica_pool.acquire()
+    return primary_pool.acquire()
+```
+
+| Aspect | Detail |
+|--------|--------|
+| **Advantage** | Horizontally scale read capacity |
+| **Disadvantage** | 100-500ms replication lag; read-after-write inconsistency |
+| **Tradeoff** | Student may not see "mark read" for 500ms — acceptable |
+| **Performance** | Primary load reduced 90%+; add replicas as users grow |
+
+### 7.7 Asynchronous Refresh
+
+Pre-compute feeds in background, not at request time.
+
+```python
+async def refresh_feeds():
+    for student in active_students:
+        feed = await db.compute_feed(student.id)
+        await redis.setex(f"feed:{student.id}:p1", 120, json.dumps(feed))
+```
+
+| Aspect | Detail |
+|--------|--------|
+| **Advantage** | Zero DB time at request; consistent response times |
+| **Disadvantage** | Stale between refreshes; wasteful for inactive users |
+| **Tradeoff** | Best for hot users; can skip inactive students |
+| **Performance** | 0ms DB time at request (pure cache) |
+
+### 7.8 Comparison Summary
+
+| Solution | DB Reduction | Latency | Complexity | Best For |
+|----------|-------------|---------|------------|----------|
+| Redis Cache | 95% | ⬇️ 50x | Medium | All scenarios |
+| Pagination | 80% | ⬇️ 10x | Low | Every API |
+| Infinite Scroll | 70% | ⬇️ Progressive | Medium | Web/mobile |
+| Lazy Loading | 60% | ⬇️ Initial | Low | Detail-heavy |
+| WebSockets | 99% vs poll | Real-time | High | Active users |
+| Read Replicas | 90% primary | Same | Medium | High reads |
+| Async Refresh | 100% at req | Pre-computed | High | Hot feeds |
+
+**Recommended**: Redis + Cursor Pagination + WebSockets + Read Replicas.
+
+---
+
+## 8. Stage 5: Reliable Massive Delivery Architecture
+
+### 8.1 The Flawed Implementation
+
+```python
+# BAD: Sequential, coupled, no error handling
+def send_notification(notification, users):
+    for user in users:                           # 10,000 users
+        save_to_database(notification, user)      # DB write
+        send_email(user.email, notification)      # Email API
+        send_push(user.device_token, notification) # Push API
+```
+
+### 8.2 Problems Identified
+
+#### 1. Sequential Bottleneck
+
+Each user processed one at a time. 10K users × 305ms each = **50+ minutes**. API times out.
+
+#### 2. No Retry Mechanism
+
+Email failure at user #3,000 crashes the loop. Users #3,001-10,000 never processed.
+
+#### 3. Poor Fault Tolerance
+
+Single failure (email service down, DB timeout) stops the **entire pipeline**. No channel isolation.
+
+#### 4. Partial Failures → Inconsistent State
+
+DB says "delivered" but student never got the email. No detection or recovery.
+
+#### 5. No Idempotency
+
+Restart after crash at user #5,000 → users #1-5,000 get **duplicate** notifications.
+
+#### 6. Scalability Limitations
+
+Single-threaded. More users = linearly slower. No parallelism.
+
+#### 7. No Async Processing
+
+API blocks for 50+ minutes. Caller gets timeout with no status feedback.
+
+### 8.3 Redesigned Architecture
+
+```
+┌─────────────┐
+│  API Server  │  POST /notifications → returns in <100ms
+└──────┬──────┘
+       │ 1. Save notification to DB
+       │ 2. Publish fan-out job to queue
+       ▼
+┌─────────────────────────────────┐
+│        Message Queue            │
+│   (RabbitMQ / Kafka / Redis)    │
+├─────────┬─────────┬─────────────┤
+│ email   │  push   │  db_delivery│
+│ queue   │  queue  │  queue      │
+└────┬────┘────┬────┘──────┬──────┘
+     ▼         ▼           ▼
+┌─────────┐ ┌─────────┐ ┌──────────┐
+│ Email   │ │  Push   │ │ DB Write │
+│ Workers │ │ Workers │ │ Workers  │
+│ (×5)    │ │ (×3)    │ │ (×3)     │
+└────┬────┘ └────┬────┘ └─────┬────┘
+     │    On failure:         │
+     ▼           ▼            ▼
+┌─────────────────────────────────┐
+│     Dead Letter Queue (DLQ)     │
+│  Failed → retry or alert        │
+└─────────────────────────────────┘
+```
+
+### 8.4 Technology Choices
+
+| Technology | Use Case | Why |
+|------------|----------|-----|
+| **RabbitMQ** | Task queues | Reliable delivery, DLQ, ack/nack |
+| **Kafka** | Event stream | High throughput, ordered, replayable |
+| **Redis Queue** | Lightweight | Simple, fast, good for <100K jobs/day |
+| **Celery** | Python workers | Native retry, beat scheduler |
+
+**Recommended**: Celery + RabbitMQ for Python-native async with reliable delivery.
+
+### 8.5 Implementation
+
+#### API Layer (Fast Response)
+
+```python
+@app.post("/api/v1/notifications")
+async def create_notification(payload):
+    notification = await db.insert(payload)
+    fan_out_task.delay(notification.id)      # Enqueue, return instantly
+    return {"notificationId": notification.id, "status": "QUEUED"}
+```
+
+#### Fan-Out Worker
+
+```python
+@celery.task(bind=True, max_retries=3)
+def fan_out_task(self, notification_id):
+    students = db.get_targeted_students(notification_id)
+    for student in students:
+        deliver_email.delay(notification_id, student.id)
+        deliver_push.delay(notification_id, student.id)
+        record_delivery.delay(notification_id, student.id)
+```
+
+#### Channel Workers with Retry + Idempotency
+
+```python
+@celery.task(bind=True, max_retries=5,
+             retry_backoff=True, retry_jitter=True)
+def deliver_email(self, notification_id, student_id):
+    key = f"email:{notification_id}:{student_id}"
+    if redis.exists(key):
+        return "ALREADY_SENT"           # Idempotency guard
+    try:
+        email_service.send(student_id, notification_id)
+        redis.setex(key, 86400, "sent")
+    except EmailServiceDown:
+        raise self.retry(countdown=60)  # Retry in 60s
+    except InvalidEmail:
+        dead_letter.publish(notification_id, student_id, "INVALID_EMAIL")
+```
+
+### 8.6 Why Decouple Email, DB, and Push?
+
+| Scenario | Coupled (BAD) | Decoupled (GOOD) |
+|----------|---------------|-------------------|
+| Email down 10 min | All stop | Only emails queue up |
+| Push token expired | Loop crashes | Push worker → DLQ |
+| DB timeout | Everything fails | DB retries; others continue |
+| Partial failure | Inconsistent state | Independent tracking |
+
+### 8.7 Key Concepts
+
+**Eventual Consistency**: DB at T+0, push at T+2s, email at T+30s. Acceptable — not ACID-critical.
+
+**Retry with Backoff**: 60s → 120s → 240s → 480s → DLQ. Prevents thundering herd.
+
+**Dead Letter Queue**: After max retries, failed jobs go to DLQ for manual inspection, alerting, and compliance auditing.
+
+**Idempotency**: Redis key `email:{notif}:{student}` checked before every send. Re-runs never duplicate.
+
+### 8.8 Performance Comparison
+
+| Metric | Sequential (BAD) | Queue-Based (GOOD) |
+|--------|------------------|-------------------|
+| 10K deliveries | 50+ minutes | < 30 seconds |
+| Failure at #5K | Stops entirely | Only that task retries |
+| Email down | All blocked | Emails queue, rest continues |
+| Duplicates | High on restart | Zero (idempotency) |
+| API response | Timeout | < 100ms |
+| Scalability | More users = slower | More workers = faster |
+
+---
+
+*Document version: 3.0 | Roll: 22MIS1084*

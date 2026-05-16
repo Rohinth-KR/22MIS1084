@@ -7,6 +7,7 @@
 3. [Stage 1: Real-Time Delivery](#3-stage-1-real-time-delivery)
 4. [Stage 2: Database Design](#4-stage-2-database-design)
 5. [Stage 2: Scalability Planning](#5-stage-2-scalability-planning)
+6. [Stage 3: Query Optimization & Indexing](#6-stage-3-query-optimization--indexing)
 
 ---
 
@@ -718,4 +719,229 @@ Shard 3: students T-Z → DB cluster 4
 
 ---
 
-*Document version: 1.0 | Roll: 22MIS1084*
+*Document version: 2.0 | Roll: 22MIS1084*
+
+---
+
+## 6. Stage 3: Query Optimization & Indexing
+
+### 6.1 The Slow Query — Analysis
+
+Consider the following query that fetches unread notifications for a student:
+
+```sql
+-- SLOW VERSION (no proper indexes)
+SELECT n.notification_id, n.title, n.category, n.priority, n.created_at
+FROM notifications n
+JOIN delivery_records dr ON n.notification_id = dr.notification_id
+WHERE dr.student_id = 'stu-abc-123'
+  AND dr.is_read = false
+ORDER BY n.created_at DESC
+LIMIT 20;
+```
+
+On a database with **millions of notifications** and **tens of millions of delivery records**, this query will be extremely slow. Here's why:
+
+### 6.2 Why This Query Is Slow
+
+#### Problem 1: Full Table Scan on `delivery_records`
+
+Without an index on `(student_id, is_read)`, PostgreSQL must perform a **sequential scan** across the entire `delivery_records` table to find rows matching a specific student with `is_read = false`. With 180M+ rows, this scans every single row.
+
+```
+Seq Scan on delivery_records  (cost=0.00..4125000.00 rows=180000000)
+  Filter: (student_id = 'stu-abc-123' AND is_read = false)
+  Rows Removed by Filter: 179,999,800
+```
+
+**Impact**: O(N) scan instead of O(log N) index lookup. The query reads millions of irrelevant rows before finding the ~200 matching rows.
+
+#### Problem 2: Inefficient JOIN Without Index Support
+
+The join on `n.notification_id = dr.notification_id` triggers a **Nested Loop** or **Hash Join** against the `notifications` table. Without a covering index, PostgreSQL must perform random I/O lookups for each matched delivery record.
+
+#### Problem 3: Expensive Sorting (`ORDER BY n.created_at DESC`)
+
+After filtering and joining, PostgreSQL must **sort the entire result set** by `created_at DESC` before applying `LIMIT 20`. Without an index that provides pre-sorted data, this requires:
+
+- Materializing all matching rows into memory
+- Running an in-memory or disk-based sort (if results exceed `work_mem`)
+- Discarding all but 20 rows
+
+```
+Sort  (cost=85000.00..85500.00 rows=200000)
+  Sort Key: n.created_at DESC
+  Sort Method: external merge  Disk: 45MB
+```
+
+#### Problem 4: Large Dataset Traversal Cost
+
+The combination of full scan + unsupported join + filesort means the query touches millions of pages on disk. With cold caches, each page read is a physical I/O operation (~10ms on HDD). Total execution can exceed **30+ seconds**.
+
+### 6.3 Optimized Solution — Composite Index
+
+The critical fix is a **composite index** on the `delivery_records` table:
+
+```sql
+CREATE INDEX idx_dr_student_read_created
+ON delivery_records (student_id, is_read, delivered_at DESC);
+```
+
+**Why this specific column order?**
+
+| Position | Column | Reason |
+|----------|--------|--------|
+| 1st | `student_id` | Equality filter (`=`) — narrows to one student's rows |
+| 2nd | `is_read` | Equality filter (`= false`) — narrows to unread only |
+| 3rd | `delivered_at DESC` | Sort order — provides pre-sorted results, eliminates filesort |
+
+**Execution with index:**
+
+```
+Index Scan using idx_dr_student_read_created on delivery_records
+  Index Cond: (student_id = 'stu-abc-123' AND is_read = false)
+  Rows: 20 (directly from index, no sort needed)
+  Execution Time: 0.8ms
+```
+
+**Before vs After:**
+
+| Metric | Without Index | With Composite Index |
+|--------|--------------|---------------------|
+| Scan type | Sequential (full table) | Index scan (targeted) |
+| Rows examined | ~180,000,000 | ~200 |
+| Sort required | Yes (disk-based) | No (index-ordered) |
+| Execution time | 30,000+ ms | < 1 ms |
+| I/O pages read | ~500,000 | ~5 |
+
+### 6.4 Optimized Query
+
+```sql
+-- OPTIMIZED VERSION
+SELECT n.notification_id, n.title, n.category, n.priority, n.created_at
+FROM delivery_records dr
+JOIN notifications n ON n.notification_id = dr.notification_id
+WHERE dr.student_id = $1
+  AND dr.is_read = false
+ORDER BY dr.delivered_at DESC
+LIMIT 20;
+```
+
+Key changes:
+1. **Lead with `delivery_records`** — the indexed table drives the query
+2. **Sort by `dr.delivered_at DESC`** — matches the index, avoids filesort
+3. The composite index provides an **Index-Only Scan** path for the WHERE + ORDER BY
+
+### 6.5 Why Indexing Every Column Is BAD
+
+A common misconception is "more indexes = faster queries." This is **wrong**. Here's why:
+
+#### 1. Slower Write Performance (INSERT)
+
+Every `INSERT` must update **every index** on the table. With 10 indexes on `delivery_records`, each insert performs 10 additional B-tree insertions.
+
+```
+-- 1 index:  INSERT takes ~0.5ms
+-- 5 indexes: INSERT takes ~2.5ms
+-- 10 indexes: INSERT takes ~5.0ms (10x slower)
+```
+
+For a fan-out of 10K delivery records per notification, this means:
+- 1 index: 5 seconds total
+- 10 indexes: 50 seconds total — **unacceptable**
+
+#### 2. Slower Update Performance
+
+`UPDATE delivery_records SET is_read = true` must update both the row AND the index entry for `is_read`. With indexes on every column, even a single-column update triggers multiple index modifications.
+
+```
+-- UPDATE with 1 index:  ~0.3ms per row
+-- UPDATE with 10 indexes: ~3.0ms per row
+```
+
+The `mark_read` operation is the most frequent write in this system. Over-indexing makes it 10x slower.
+
+#### 3. Increased Storage Overhead
+
+Each index is a separate B-tree structure stored on disk. For a table with 180M rows:
+
+| Scenario | Table Size | Index Size | Total |
+|----------|-----------|------------|-------|
+| 2 indexes | 25 GB | 8 GB | 33 GB |
+| 5 indexes | 25 GB | 20 GB | 45 GB |
+| 10 indexes | 25 GB | 40 GB | **65 GB** |
+
+Indexes can consume **more space than the table itself**, directly increasing storage costs and reducing cache efficiency.
+
+#### 4. Index Maintenance Overhead
+
+PostgreSQL must periodically `VACUUM` and `REINDEX` indexes. More indexes means:
+- Longer VACUUM cycles (table locks)
+- More WAL (Write-Ahead Log) traffic for replication
+- Slower `pg_dump` backups
+
+#### 5. Query Planner Confusion
+
+With too many indexes, the PostgreSQL query planner must evaluate more execution plans. This increases planning time and occasionally leads to **suboptimal plan selection** (choosing a bad index over a sequential scan).
+
+**Best Practice**: Only create indexes that serve specific, frequent query patterns. Prefer composite indexes over single-column indexes.
+
+### 6.6 Required Query: Placement Notifications in Last 7 Days
+
+**Query**: Fetch students who received placement notifications in the last 7 days.
+
+```sql
+SELECT DISTINCT
+    s.student_id,
+    s.name,
+    s.roll_no,
+    s.branch,
+    s.email
+FROM students s
+JOIN delivery_records dr ON s.student_id = dr.student_id
+JOIN notifications n ON dr.notification_id = n.notification_id
+WHERE n.category = 'PLACEMENT'
+  AND dr.delivered_at >= NOW() - INTERVAL '7 days'
+ORDER BY s.name ASC;
+```
+
+**Supporting index:**
+
+```sql
+-- Composite index for category + time range filtering
+CREATE INDEX idx_notif_category_created
+ON notifications (category, created_at DESC);
+
+-- Delivery records by time range (partition-pruned)
+CREATE INDEX idx_dr_delivered_at
+ON delivery_records (delivered_at DESC);
+```
+
+**Execution plan:**
+
+1. Index scan on `notifications` using `idx_notif_category_created` → filters to `PLACEMENT` type
+2. Join to `delivery_records` using `notification_id` FK index → filters by `delivered_at >= 7 days ago`
+3. Join to `students` using `student_id` PK → fetches student details
+4. `DISTINCT` removes duplicates (one student may receive multiple placement notifications)
+
+**Expected performance:** < 5ms with proper indexes on a table with millions of rows.
+
+---
+
+### 6.7 Summary: Indexing Strategy for This System
+
+| Index | Table | Purpose | Type |
+|-------|-------|---------|------|
+| `(student_id, is_read, delivered_at DESC)` | `delivery_records` | Unread feed query | Composite |
+| `(student_id) WHERE is_read = false` | `delivery_records` | Unread count | Partial |
+| `(notification_id, is_acknowledged)` | `delivery_records` | Ack tracking | Composite |
+| `(category, created_at DESC)` | `notifications` | Category + time filter | Composite |
+| `(roll_no)` | `students` | Student lookup | Single |
+| `(branch)` | `students` | Branch targeting | Single |
+
+**Total: 6 carefully chosen indexes** — not one per column, but one per **query pattern**.
+
+---
+
+*Document version: 2.0 | Roll: 22MIS1084*
+

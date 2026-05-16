@@ -40,7 +40,7 @@ class RemoteLoggingMiddleware(BaseHTTPMiddleware):
         # ── Log: Request Entry ──────────────────────────────────
         Log(
             "backend", "info", "middleware",
-            f"Incoming {method} {path} from {client}"
+            f"{method} {path} from {client[:15]}"
         )
 
         try:
@@ -54,7 +54,7 @@ class RemoteLoggingMiddleware(BaseHTTPMiddleware):
 
             Log(
                 "backend", level, "middleware",
-                f"Completed {method} {path} → {response.status_code} in {process_time_ms}ms"
+                f"{method} {path} {response.status_code} {process_time_ms}ms"
             )
 
             # Attach timing header for observability
@@ -68,11 +68,11 @@ class RemoteLoggingMiddleware(BaseHTTPMiddleware):
             # ── Log: Unhandled Exception ────────────────────────
             Log(
                 "backend", "fatal", "middleware",
-                f"Unhandled exception on {method} {path} after {process_time_ms}ms: {str(exc)}"
+                f"Exception {method} {path} {process_time_ms}ms"
             )
             Log(
                 "backend", "error", "middleware",
-                f"Traceback: {error_trace[:500]}"
+                f"{str(exc)[:48]}"
             )
 
             return JSONResponse(

@@ -43,6 +43,11 @@ This repository contains the complete backend evaluation submission for **22MIS1
 - **Phase 4-8: Notification System Architecture** — Designed a massive-scale system (`notification_system_design.md`) including REST APIs, real-time push (WebSocket/PubSub), PostgreSQL DB design, slow query analysis with composite indexing, high-scale caching strategies, and reliable Celery/RabbitMQ async queue processing.
 - **Phase 9: Priority Inbox Implementation** — Developed a working backend service fetching real-time notifications, ranking them, and efficiently returning the Top-10.
 - **Phase 10: Final Engineering Polish** — Validated clean git history, integrated logging middleware across all microservices, and handled exceptions robustly.
+## Screenshots
+<img width="1145" height="732" alt="Screenshot 2026-05-16 170050" src="https://github.com/user-attachments/assets/002d5f05-d432-46e7-8d79-3275996c1acb" />
+<img width="1089" height="833" alt="Screenshot 2026-05-16 170128" src="https://github.com/user-attachments/assets/f1ef5400-32f1-46ef-92bb-71203a657412" />
+<img width="1248" height="964" alt="Screenshot 2026-05-16 174022" src="https://github.com/user-attachments/assets/c40d67d5-eae6-46a9-b237-99520e9b0e5b" />
+<img width="1252" height="975" alt="Screenshot 2026-05-16 174033" src="https://github.com/user-attachments/assets/14e4f735-f5ff-4a99-a4ec-e6b90fb3e4ed" />
 
 ## Algorithm Details
 
